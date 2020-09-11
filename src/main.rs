@@ -12,13 +12,15 @@ struct Quad {
 
 fn main() -> io::Result<()> {
     let mut connections: HashMap<Quad, tcp::Connection> = Default::default();
-    let tunnel = tun_tap::Iface::new("tun0", tun_tap::Mode::Tun).expect("");
+    let tunnel = tun_tap::Iface::new("tun0", tun_tap::Mode::Tun).expect("Error opening tun_tap tunnel");
     let mut buf = [0u8; 1504];
 
     loop {
         let bytes_read = tunnel.recv(&mut buf[..])?;
         // let eth_flags = u16::from_be_bytes([buf[0], buf[1]]);
         let eth_proto = u16::from_be_bytes([buf[2], buf[3]]);
+        // println!("Eth {:x?}", &buf[0..4]);
+        
         if eth_proto != 0x800 {
             // skip non IPv4 packets
             continue;
@@ -38,6 +40,7 @@ fn main() -> io::Result<()> {
             continue;
         }
 
+        // ip header size
         let iph_size = ip_header.slice().len();
 
         // parse TCP packet header
@@ -59,6 +62,6 @@ fn main() -> io::Result<()> {
             src: (ip_header.source_addr(), tcp_header.source_port()),
             dst: (ip_header.destination_addr(), tcp_header.destination_port()),
         }).or_default();
-        connection.accept(ip_header, tcp_header, &buf[datai..bytes_read]);
+        connection.accept(&tunnel, ip_header, tcp_header, &buf[datai..bytes_read])?;
     }
 }
