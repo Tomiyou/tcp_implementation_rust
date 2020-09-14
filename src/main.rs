@@ -1,6 +1,10 @@
 use std::io;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::Ipv4Addr;
+
+use std::net::TcpStream;
+use std::io::prelude::*;
 
 mod tcp;
 
@@ -58,10 +62,19 @@ fn main() -> io::Result<()> {
         let datai = 4 + iph_size + tcp_header.slice().len();
         
         // find the appropriate connection from the hashmap
-        let connection = connections.entry(Quad {
+        match connections.entry(Quad {
             src: (ip_header.source_addr(), tcp_header.source_port()),
             dst: (ip_header.destination_addr(), tcp_header.destination_port()),
-        }).or_default();
-        connection.accept(&tunnel, ip_header, tcp_header, &buf[datai..bytes_read])?;
+        }) {
+            Entry::Occupied(mut c) => {
+                c.get_mut().on_packet(&tunnel, ip_header, tcp_header, &buf[datai..bytes_read])?;
+            }
+            Entry::Vacant(e) => {
+                // check if accept returned Some connection, if so, insert it into hashmap
+                if let Some(c) = tcp::Connection::accept(&tunnel, ip_header, tcp_header)? {
+                    e.insert(c);
+                }
+            }
+        }
     }
 }
