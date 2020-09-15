@@ -8,6 +8,7 @@ pub struct Connection {
     tcpp: etherparse::TcpHeader,
 }
 
+#[derive(Debug)]
 enum State {
     Closed,
     Listen,
@@ -17,6 +18,7 @@ enum State {
     FinWait1,
     FinWait2,
     CloseWait,
+    TimeWait,
     Closing,
 }
 
@@ -62,13 +64,13 @@ impl Connection {
         // handle TCP flags and numbers
         self.tcpp.sequence_number = self.send.nxt;
         self.tcpp.acknowledgment_number = self.recv.nxt;
+        self.ipp
+            .set_payload_len(size - self.ipp.header_len() as usize)
+            .expect("Unable to set payload length");
         self.tcpp.checksum = self
             .tcpp
             .calc_checksum_ipv4(&self.ipp, payload)
             .expect("Unable to calculate tcpp checksum");
-        self.ipp
-            .set_payload_len(size)
-            .expect("Unable to set payload length");
 
         // start of slice moves with each write
         use std::io::Write;
@@ -192,79 +194,89 @@ impl Connection {
         //   >0       0     not acceptable
         //   >0      >0     RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
         //               or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
-        if seg_len == 0 {
+        let seq_okay = if seg_len == 0 {
             // 0 length segment, syn and ack are also 0 length segments, but have different rules
             if self.recv.wnd == 0 {
                 if seqn != self.recv.nxt {
-                    return Ok(());
+                    false
+                } else {
+                    true
                 }
             } else if !is_x_between(nxt_1, seqn, wnd_end) {
-                return Ok(());
+                false
+            } else {
+                true
             }
         } else {
             if self.recv.wnd == 0 {
-                return Ok(());
+                false
             } else if !is_x_between(nxt_1, seqn, wnd_end)
                 && !is_x_between(nxt_1, seqn.wrapping_add(seg_len - 1), wnd_end)
             {
-                return Ok(());
+                false
+            } else {
+                true
             }
-        }
-        self.recv.nxt = seqn.wrapping_add(seg_len);
-
-        //  A new acknowledgment (called an "acceptable ack"), is one for which
-        //  the inequality below holds:
-        //  SND.UNA < SEG.ACK =< SND.NXT
-        if !is_x_between(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
-            //  If the connection is in any non-synchronized state (LISTEN,
-            //  SYN-SENT, SYN-RECEIVED), and the incoming segment acknowledges
-            //  something not yet sent (the segment carries an unacceptable ACK),
-            //  a reset is sent.
-            if !self.state.is_synchronized() {
-                // send reset
-                self.send_reset(net_ifc, tcp_header, data)?;
-            }
+        };
+        
+        if !seq_okay {
+            self.write(net_ifc, &[])?;
             return Ok(());
         }
-        self.send.una = ackn;
+        self.recv.nxt = seqn.wrapping_add(seg_len);
+        
+        if !tcp_header.ack() {
+            return Ok(());
+        }
 
-        // now respond to the packet with appropriate state rules
-        match self.state {
-            State::Closed => {
-                unimplemented!("Closed state but connection already set??");
-            }
-            State::Listen => {}
-            State::SynRcvd => {
-                if !tcp_header.ack() {
-                    // expected ACK as response to SYN,ACK... something weird happened
-                    return Ok(());
-                }
-
+        if let State::SynRcvd = self.state {
+            if is_x_between(
+                self.send.una.wrapping_sub(1),
+                ackn,
+                self.send.nxt.wrapping_add(1),
+            ) {
+                // must have ACKed our SYN, since we detected at least one acked byte,
+                // and we have only sent one byte (the SYN).
                 self.state = State::Estab;
+            } else {
+                // TODO: <SEQ=SEG.ACK><CTL=RST>
+            }
+        }
 
+        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+            if !is_x_between(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+                return Ok(());
+            }
+            self.send.una = ackn;
+            // TODO
+            assert!(data.is_empty());
+
+            if let State::Estab = self.state {
+                // now let's terminate the connection!
+                // TODO: needs to be stored in the retransmission queue!
                 self.tcpp.fin = true;
                 self.write(net_ifc, &[])?;
                 self.state = State::FinWait1;
             }
-            State::SynSent => {}
-            State::Estab => {
-                unimplemented!();
+        }
+
+        if let State::FinWait1 = self.state {
+            if self.send.una == self.send.iss + 2 {
+                // our FIN has been ACKed!
+                self.state = State::FinWait2;
             }
-            State::FinWait1 => {
-                if !tcp_header.fin() || !data.is_empty() {
-                    unimplemented!();
+        }
+
+        if tcp_header.fin() {
+            match self.state {
+                State::FinWait2 => {
+                    // we're done with the connection!
+                    self.write(net_ifc, &[])?;
+                    self.state = State::TimeWait;
                 }
-
-                self.tcpp.fin = false;
-                self.write(net_ifc, &[])?;
-                self.state = State::Closing;
+                _ => unimplemented!(),
             }
-            State::FinWait2 => {}
-            State::CloseWait => {}
-            State::Closing => {
-
-            }
-        };
+        }
 
         Ok(())
     }

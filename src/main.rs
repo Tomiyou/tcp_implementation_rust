@@ -3,9 +3,6 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::Ipv4Addr;
 
-use std::net::TcpStream;
-use std::io::prelude::*;
-
 mod tcp;
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
@@ -60,7 +57,7 @@ fn main() -> io::Result<()> {
 
         // beginning of TCP payload within buf
         let datai = 4 + iph_size + tcp_header.slice().len();
-        
+
         // find the appropriate connection from the hashmap
         match connections.entry(Quad {
             src: (ip_header.source_addr(), tcp_header.source_port()),
